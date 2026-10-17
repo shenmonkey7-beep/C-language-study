@@ -48,14 +48,21 @@ float PID_PositionCompute(PID_Controller_t *pid, float target, float current)
     pid->err = target - current;
 
     // 积分分离与抗饱和
-    pid->integral += pid->err;
-    if (pid->integral > pid->max_integral) pid->integral = pid->max_integral;
-    if (pid->integral < -pid->max_integral) pid->integral = -pid->max_integral;
+    float next_integral = pid->integral + pid->err;
+    if (next_integral > pid->max_integral) next_integral = pid->max_integral;
+    if (next_integral < -pid->max_integral) next_integral = -pid->max_integral;
 
     float derivative = pid->err - pid->last_err;
     pid->last_err = pid->err;
 
-    float output = (pid->kp * pid->err) + (pid->ki * pid->integral) + (pid->kd * derivative);
+    float output = (pid->kp * pid->err) + (pid->ki * next_integral) + (pid->kd * derivative);
+    // 输出已饱和时仅允许使其退出饱和的积分，避免堵转后长时间反应迟滞。
+    if (!((output > pid->max_output && pid->err > 0.0f) ||
+          (output < -pid->max_output && pid->err < 0.0f))) {
+        pid->integral = next_integral;
+    } else {
+        output = pid->kp * pid->err + pid->ki * pid->integral + pid->kd * derivative;
+    }
 
     // 输出限幅
     if (output > pid->max_output) output = pid->max_output;
@@ -95,6 +102,7 @@ int16_t Speed_Loop_Right(int16_t target_pulse, int16_t current_pulse, float righ
     }
 
     // 乘以配平因子
+    if (!(right_trim >= 0.5f && right_trim <= 2.0f)) right_trim = 1.0f;
     float trimmed_target = (float)target_pulse * right_trim;
     return (int16_t)PID_PositionCompute(&s_pid_speed_r, trimmed_target, (float)current_pulse);
 }

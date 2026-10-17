@@ -1,0 +1,8 @@
+# Keil outputs and local regression binaries
+Objects/
+Listings/
+*.uvguix.*
+*.uvoptx
+*.exe
+*.o
+__pycache__/

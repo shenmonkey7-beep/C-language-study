@@ -40,6 +40,7 @@ void Motor_Init(void)
     GPIO_Init(GPIOA, &GPIO_InitStructure);
 
     // 3. 定时器 TIM2 基础时基配置
+    TIM_TimeBaseStructInit(&TIM_TimeBaseStructure);
     TIM_TimeBaseStructure.TIM_Period = PWM_MAX_LIMIT;
     TIM_TimeBaseStructure.TIM_Prescaler = 0;
     TIM_TimeBaseStructure.TIM_ClockDivision = TIM_CKD_DIV1;
@@ -47,6 +48,7 @@ void Motor_Init(void)
     TIM_TimeBaseInit(TIM2, &TIM_TimeBaseStructure);
 
     // 4. PWM 模式输出配置
+    TIM_OCStructInit(&TIM_OCInitStructure);
     TIM_OCInitStructure.TIM_OCMode = TIM_OCMode_PWM1;
     TIM_OCInitStructure.TIM_OutputState = TIM_OutputState_Enable;
     TIM_OCInitStructure.TIM_Pulse = 0;

@@ -31,6 +31,7 @@ typedef struct {
     uint8_t  is_right_angle_left;           // 是否检测到左直角弯特征
     uint8_t  is_right_angle_right;          // 是否检测到右直角弯特征
     uint8_t  all_white;                     // 脱线状态（8路全部为白底）
+    uint8_t  adc_valid;                     // 全部采样成功才为1；故障时必须停车
 } Track_Result_t;
 
 void Track_Init(void);

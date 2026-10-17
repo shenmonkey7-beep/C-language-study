@@ -10,20 +10,20 @@
  *   - 板载按键: KEY1(PA11), KEY2(PA12)，用于运行时免烧录切换任务與启停
  * 
  * 运行模式设定 (RUN_MODE / g_task):
- *   10: 基础任务全流程 (1m×1m正方形循迹 + 4直角弯平稳通过 + 定点停车不压线)
+ *   10: 方形巡线，在第4个直角特征（A点）停车；停车位置须实车验证
+ *   11: A-B 单边巡线，到第一个直角特征停车
  *    0: 直行闭环定速调试 (受 TEST_RUN0_STOP_CM 控制，0.0f 为不限距)
  *    1: 纯巡线连续调试 (连续巡线过弯，不计圈停车)
  *    2: 单次直角弯调试 (过完第 1 个直角弯回正后自动停车)
  *    3: 灰度传感器标定模式 (Keil Watch 查看 g_dbg[0..7])
  *    4: 电机驱动与接线自检 (交替正反转)
- *    6: 自动配平模式 (计算双轮机械差异，生成 g_trim)
+ *    6: 同 PWM 编码器对比模式（不自动改写 g_trim）
  *   20: 任务二 - 倒车入库 (定距直行 -> 差速倒车转90度 -> 倒车入库 -> 停车入位)
  *   21: 任务二 - 侧方停车 (定距直行 -> 斜向倒车入位 -> 回正停车)
  * ============================================================================
  */
 
 #include "stm32f10x.h"
-#include <stdio.h>
 #include <string.h>
 
 #include "motor.h"
@@ -35,8 +35,8 @@
 #define RUN_MODE                    10      // 默认基础任务全流程
 #define CTRL_PERIOD_MS              10      // 控制周期严格保持 10ms (坑点4)
 #define TEST_RUN0_STOP_CM           0.0f    // 直行定距停车强制关闭 (0.0f=不限距离，坑点2)
-#define DEFAULT_SPEED_CMPS          12.0f   // 验收推荐巡线线速度: 10~15 cm/s (稳且不易脱线)
-#define STOP_AFTER_4TH_CORNER_CM    45.0f   // 过完第4个直角弯后前进至A点停车的距离上限(cm)
+#define DEFAULT_SPEED_CMPS          12.0f   // 低速调试值；尚不能满足整圈30秒限时，须实测提速
+#define LINE_LOST_LIMIT_MS          500U    // 持续丢线后锁定停车
 
 // --------------------------- 全局调试变量 (Keil Watch 可直接观测) ---------------------------
 volatile uint16_t g_dbg[8];                 // 8路灰度原始读数
@@ -49,7 +49,9 @@ volatile float    g_trim = 1.00f;           // 右轮配平因子 (坑点3)
 volatile float    g_pulse_per_cm = DEFAULT_PULSE_PER_CM; // 脉冲当量 (推车100cm实测校准)
 volatile uint16_t g_track_threshold = DEFAULT_TRACK_THRESHOLD; // 灰度阈值
 volatile uint8_t  g_task = RUN_MODE;        // 当前执行任务/模式 (可在 Watch 窗口或按键在线修改)
+volatile uint8_t  g_fault = 0;             // 1=丢线, 2=转弯超时, 3=控制超时, 4=ADC, 5=参数
 volatile uint8_t  g_corner_count = 0;       // 弯道/直角计数
+volatile int32_t g_trim_sum_l = 0, g_trim_sum_r = 0; // 同PWM采样统计，仅用于诊断
 
 // --------------------------- 状态机枚举 ---------------------------
 typedef enum {
@@ -57,7 +59,6 @@ typedef enum {
     STATE_START_ARMING,     // 起步/出弯武装：防起跑线或刚出弯误判直角 (坑点5)
     STATE_TRACKING,         // 闭环寻迹巡线
     STATE_CORNER_TURNING,   // 直角弯强制差速转向过渡
-    STATE_APPROACHING_STOP, // 过完4个弯后减速准备定点停车
     STATE_STOPPED,          // 停车刹车制动
     // 泊车状态
     STATE_PARK_FORWARD,
@@ -129,21 +130,27 @@ static void Button_Init(void)
 // 检查按键切换模式 (坑点7: 验收中途不能重烧程序，支持按键切换任务与重启当前任务)
 static void Check_Button(void)
 {
-    static uint32_t last_press = 0;
-    if (g_system_ticks_ms - last_press < 300) return;
-
-    // KEY1 (PA11): 在 基础巡线(10) -> 倒车入库(20) -> 侧方停车(21) 之间轮换
-    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == Bit_RESET) {
-        last_press = g_system_ticks_ms;
-        if (g_task == 10) g_task = 20;
-        else if (g_task == 20) g_task = 21;
-        else g_task = 10;
-        g_state = STATE_IDLE;
+    static uint8_t stable = 0, candidate = 0;
+    static uint32_t changed_ms = 0;
+    uint8_t keys = 0;
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_11) == Bit_RESET) keys |= 1;
+    if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_12) == Bit_RESET) keys |= 2;
+    if (keys != candidate) {
+        candidate = keys;
+        changed_ms = g_system_ticks_ms;
     }
-    // KEY2 (PA12): 重新启动当前任务
-    else if (GPIO_ReadInputDataBit(GPIOA, GPIO_Pin_12) == Bit_RESET) {
-        last_press = g_system_ticks_ms;
-        g_state = STATE_IDLE;
+    if (keys != stable && g_system_ticks_ms - changed_ms >= 30) {
+        uint8_t pressed = keys & (uint8_t)~stable;
+        stable = keys;
+        if (pressed & 1) {
+            if (g_task == 10) g_task = 11;
+            else if (g_task == 11) g_task = 20;
+            else if (g_task == 20) g_task = 21;
+            else g_task = 10;
+            g_state = STATE_IDLE;
+        } else if (pressed & 2) {
+            g_state = STATE_IDLE;
+        }
     }
 }
 
@@ -153,10 +160,28 @@ static void Process_Track_And_Basic_Task(Track_Result_t *track, uint8_t mode)
     static uint32_t arm_start_ms = 0;
     static uint32_t turn_start_ms = 0;
     static uint8_t  s_armed = 0;
+    static uint32_t lost_ms = 0;
+    static uint8_t lost = 0;
+    static uint8_t corner_samples = 0;
     static int8_t   turn_direction = 0; // -1: 左转直角, +1: 右转直角
 
     // 将目标速度(cm/s)转换为每个控制周期(10ms)的目标脉冲数
     float base_pulse = (DEFAULT_SPEED_CMPS * g_pulse_per_cm) * 0.01f;
+
+    if (g_state == STATE_IDLE) {
+        lost = 0;
+        corner_samples = 0;
+        g_fault = 0;
+    }
+    if (g_state == STATE_START_ARMING || g_state == STATE_TRACKING) {
+        if (track->all_white) {
+            if (!lost) { lost = 1; lost_ms = g_system_ticks_ms; }
+            if (g_system_ticks_ms - lost_ms >= LINE_LOST_LIMIT_MS) {
+                g_fault = 1;
+                g_state = STATE_STOPPED;
+            }
+        } else lost = 0;
+    }
 
     switch (g_state) {
         case STATE_IDLE:
@@ -179,7 +204,8 @@ static void Process_Track_And_Basic_Task(Track_Result_t *track, uint8_t mode)
                 g_pwmR = Speed_Loop_Right(target_r, g_encR, g_trim);
                 Motor_SetSpeed(g_pwmL, g_pwmR);
 
-                if (track->black_count >= 1 && track->black_count <= 2) {
+                if (track->black_count >= 1 && track->black_count <= 2 &&
+                    (track->is_black[3] || track->is_black[4])) {
                     if (g_system_ticks_ms - arm_start_ms >= 300) {
                         s_armed = 1;
                         g_state = STATE_TRACKING;
@@ -195,8 +221,17 @@ static void Process_Track_And_Basic_Task(Track_Result_t *track, uint8_t mode)
             // 正常闭环寻迹
             {
                 // 检测是否到达直角弯
-                if (s_armed && (track->is_right_angle_left || track->is_right_angle_right || track->is_cross_or_stop)) {
+                if (s_armed && !track->is_cross_or_stop &&
+                    (track->is_right_angle_left || track->is_right_angle_right)) {
+                    if (++corner_samples < 3) break;
+                    corner_samples = 0;
+                    // 从 A 朝 B 发车：第1个弯是 B，第4个弯是 A；到点即停车。
                     g_corner_count++;
+                    if (mode == 11 || (mode == 10 && g_corner_count >= 4)) {
+                        Motor_Brake();
+                        g_state = STATE_STOPPED;
+                        break;
+                    }
                     turn_start_ms = g_system_ticks_ms;
 
                     // 根据左右压黑探头数量判断转弯方向
@@ -211,6 +246,7 @@ static void Process_Track_And_Basic_Task(Track_Result_t *track, uint8_t mode)
                     break;
                 }
 
+                corner_samples = 0;
                 // 正常外环 PD 转向 + 内环 PI 速度控制
                 float steer = Steering_Loop(track->line_pos_error);
                 int16_t target_l = (int16_t)(base_pulse + steer);
@@ -236,10 +272,16 @@ static void Process_Track_And_Basic_Task(Track_Result_t *track, uint8_t mode)
                 }
                 Motor_SetSpeed(g_pwmL, g_pwmR);
 
-                // 旋转至少 320ms 且中心探头(Ch3或Ch4)重新寻到黑线后完成转弯 (超时 1200ms 保护)
+                // 中心单线恢复才算完成转弯；1200ms超时进入故障停车。
                 uint32_t turn_elapsed = g_system_ticks_ms - turn_start_ms;
-                if ((turn_elapsed >= 320 && (track->is_black[3] || track->is_black[4])) ||
-                    (turn_elapsed >= 1200)) {
+                if (turn_elapsed >= 1200) {
+                    g_fault = 2;
+                    Motor_Brake();
+                    g_state = STATE_STOPPED;
+                    break;
+                }
+                if (turn_elapsed >= 320 && track->black_count >= 1 &&
+                    track->black_count <= 2 && (track->is_black[3] || track->is_black[4])) {
                     PID_ResetAll();
 
                     // Mode 2: 单次直角弯调试模式，转完第 1 个弯即停车
@@ -249,38 +291,10 @@ static void Process_Track_And_Basic_Task(Track_Result_t *track, uint8_t mode)
                         break;
                     }
 
-                    // Mode 10: 基础任务全流程，转完第 4 个直角弯后进入终点减速停车阶段
-                    if (mode == 10 && g_corner_count >= 4) {
-                        Encoder_ResetDistance();
-                        g_state = STATE_APPROACHING_STOP;
-                        break;
-                    }
-
                     // 否则重新进入出弯武装状态，防止同一弯道重复计数
                     s_armed = 0;
                     arm_start_ms = g_system_ticks_ms;
                     g_state = STATE_START_ARMING;
-                }
-            }
-            break;
-
-        case STATE_APPROACHING_STOP:
-            // 过完第 4 个直角弯返回起点 A 区：减速巡线并在到达停止点/停止线时立即刹车
-            {
-                float slow_pulse = base_pulse * 0.5f;
-                float steer = Steering_Loop(track->line_pos_error);
-                int16_t target_l = (int16_t)(slow_pulse + steer);
-                int16_t target_r = (int16_t)(slow_pulse - steer);
-
-                g_pwmL = Speed_Loop_Left(target_l, g_encL);
-                g_pwmR = Speed_Loop_Right(target_r, g_encR, g_trim);
-                Motor_SetSpeed(g_pwmL, g_pwmR);
-
-                // 到达预设终点距离或检测到终点横线时立即刹车
-                if (Encoder_GetAverageDistanceCm(g_pulse_per_cm) >= STOP_AFTER_4TH_CORNER_CM ||
-                    (Encoder_GetAverageDistanceCm(g_pulse_per_cm) >= 15.0f && track->is_cross_or_stop)) {
-                    Motor_Brake();
-                    g_state = STATE_STOPPED;
                 }
             }
             break;
@@ -391,8 +405,6 @@ static void Process_Parking_Task(uint8_t park_type)
 static void Process_Calibration_And_Debug_Mode(void)
 {
     static uint32_t mode_start_ms = 0;
-    static int32_t  trim_sum_l = 0;
-    static int32_t  trim_sum_r = 0;
     static uint16_t trim_samples = 0;
 
     if (g_state == STATE_IDLE) {
@@ -400,9 +412,10 @@ static void Process_Calibration_And_Debug_Mode(void)
         PID_ResetAll();
         Encoder_ResetDistance();
         mode_start_ms = g_system_ticks_ms;
-        trim_sum_l = 0;
-        trim_sum_r = 0;
+        g_trim_sum_l = 0;
+        g_trim_sum_r = 0;
         trim_samples = 0;
+        g_fault = 0;
         g_state = STATE_TRACKING;
     }
 
@@ -431,23 +444,35 @@ static void Process_Calibration_And_Debug_Mode(void)
             Motor_SetSpeed(-2800, -2800);
         }
     } else if (g_task == 6) {
-        // Mode 6: 双轮自动配平 (前 0.5 秒预热克服启动惯性，后 1.5 秒稳态采样计算 g_trim)
+        // Mode 6: 同 PWM 编码器对比，0.5 秒预热 + 1.5 秒采样，不修改闭环配平系数
         Motor_SetSpeed(3200, 3200);
         trim_samples++;
         if (trim_samples > 50 && trim_samples <= 200) {
-            trim_sum_l += g_encL;
-            trim_sum_r += g_encR;
+            g_trim_sum_l += g_encL;
+            g_trim_sum_r += g_encR;
         } else if (trim_samples > 200) {
-            if (trim_sum_r > 10) {
-                g_trim = (float)trim_sum_l / (float)trim_sum_r;
-            }
+            // 同 PWM 的转速比无法推出编码器每厘米当量，不能写入闭环目标 g_trim。
+            // 保留原始累计脉冲供排查电机/编码器；配平须推车量距标定。
             Motor_Brake();
-            g_task = 3; // 配平完成后切回静态观察模式，可在 Watch 窗口查看 g_trim
+            g_task = 3; // 采样后切回静态观察模式
             g_state = STATE_IDLE;
         }
     } else {
         Motor_Stop();
     }
+}
+
+static uint8_t Control_CheckPeriod(uint32_t *last_ctrl_time)
+{
+    uint32_t elapsed = g_system_ticks_ms - *last_ctrl_time;
+    if (elapsed < CTRL_PERIOD_MS) return 0;
+    *last_ctrl_time = g_system_ticks_ms;
+    if (elapsed >= 2U * CTRL_PERIOD_MS) {
+        Motor_Brake();
+        g_fault = 3;
+        g_state = STATE_STOPPED;
+    }
+    return 1;
 }
 
 // --------------------------- 主函数 ---------------------------
@@ -477,8 +502,7 @@ int main(void)
 
     while (1) {
         // 严格以 10ms 控制周期执行 (坑点4)
-        if ((g_system_ticks_ms - last_ctrl_time) >= CTRL_PERIOD_MS) {
-            last_ctrl_time += CTRL_PERIOD_MS;
+        if (Control_CheckPeriod(&last_ctrl_time)) {
 
             // 1. 读取左右编码器脉冲增量
             g_encL = Encoder_GetLeftSpeed();
@@ -498,8 +522,27 @@ int main(void)
                 g_state = STATE_IDLE;
             }
 
-            // 4. 根据任务模式分支调度
-            if (g_task == 10 || g_task == 1 || g_task == 2) {
+            // 4. 故障停车锁定，只有任务切换或重新启动才能解除。
+            if (g_fault && g_state != STATE_IDLE) {
+                Motor_Brake();
+                continue;
+            }
+            if (g_state == STATE_IDLE) g_fault = 0;
+            if (!track_data.adc_valid) {
+                g_fault = 4;
+                g_state = STATE_STOPPED;
+                Motor_Brake();
+                continue;
+            }
+            if (!(g_pulse_per_cm > 0.01f && g_pulse_per_cm < 1000.0f) ||
+                !(g_trim >= 0.5f && g_trim <= 2.0f) ||
+                g_track_threshold == 0 || g_track_threshold > 4095) {
+                g_fault = 5;
+                g_state = STATE_STOPPED;
+                Motor_Brake();
+                continue;
+            }
+            if (g_task == 10 || g_task == 11 || g_task == 1 || g_task == 2) {
                 Process_Track_And_Basic_Task(&track_data, g_task);
             } else if (g_task == 20 || g_task == 21) {
                 Process_Parking_Task(g_task);

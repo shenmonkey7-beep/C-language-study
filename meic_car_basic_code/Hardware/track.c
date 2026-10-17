@@ -1,6 +1,17 @@
 #include "track.h"
 
 static float s_last_valid_error = 0.0f;
+static uint8_t s_adc_ready = 0;
+#define ADC_WAIT_LIMIT 100000U
+
+static uint8_t Track_WaitCalibration(uint8_t reset)
+{
+    uint32_t remaining = ADC_WAIT_LIMIT;
+    while (reset ? ADC_GetResetCalibrationStatus(ADC1) : ADC_GetCalibrationStatus(ADC1)) {
+        if (--remaining == 0) return 0;
+    }
+    return 1;
+}
 
 static void Track_GPIO_Init(void)
 {
@@ -42,14 +53,16 @@ static void Track_ADC_Init(void)
 
     // 校准 ADC1
     ADC_ResetCalibration(ADC1);
-    while (ADC_GetResetCalibrationStatus(ADC1));
+    if (!Track_WaitCalibration(1)) return;
     ADC_StartCalibration(ADC1);
-    while (ADC_GetCalibrationStatus(ADC1));
+    if (!Track_WaitCalibration(0)) return;
+    s_adc_ready = 1;
 }
 
 void Track_Init(void)
 {
     Track_GPIO_Init();
+    s_adc_ready = 0;
     Track_ADC_Init();
     s_last_valid_error = 0.0f;
 }
@@ -71,9 +84,13 @@ static void Track_SelectChannel(uint8_t ch)
 
 static uint16_t Track_ReadADC_Channel8(void)
 {
+    uint32_t remaining = ADC_WAIT_LIMIT;
     ADC_RegularChannelConfig(ADC1, ADC_Channel_8, 1, ADC_SampleTime_55Cycles5);
+    ADC_ClearFlag(ADC1, ADC_FLAG_EOC);
     ADC_SoftwareStartConvCmd(ADC1, ENABLE);
-    while (!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC));
+    while (!ADC_GetFlagStatus(ADC1, ADC_FLAG_EOC)) {
+        if (--remaining == 0) return 0xFFFFU;
+    }
     return ADC_GetConversionValue(ADC1);
 }
 
@@ -92,10 +109,12 @@ void Track_ScanAll(Track_Result_t *result, uint16_t threshold)
     uint8_t count = 0;
     uint8_t left_cnt = 0;
     uint8_t right_cnt = 0;
+    result->adc_valid = s_adc_ready;
 
     for (uint8_t i = 0; i < TRACK_NUM_CHANNELS; i++) {
         Track_SelectChannel(i);
-        result->raw_adc[i] = Track_ReadADC_Channel8();
+        result->raw_adc[i] = s_adc_ready ? Track_ReadADC_Channel8() : 0xFFFFU;
+        if (result->raw_adc[i] == 0xFFFFU) result->adc_valid = 0;
 
         // 坑点6：读数 < 阈值 判定为压黑线（8路红光模拟分时版）
         if (result->raw_adc[i] < threshold) {
